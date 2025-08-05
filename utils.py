@@ -1737,6 +1737,115 @@ def batch_rand_perlin_2d_octaves(lac, b, shape, res, octaves=1, persistence=0.5,
         amplitude *= persistence
     return noise
 
+
+def new_batch_rand_perlin_2d(b, shape, res, fade=lambda t: 6*t**5 - 15*t**4 + 10*t**3, device=None):
+    delta = (res[0] / shape[0], res[1] / shape[1])
+    d = (shape[0] // res[0], shape[1] // res[1])
+
+    grid = torch.stack(torch.meshgrid(
+        torch.arange(0, res[0], delta[0], device=device),
+        torch.arange(0, res[1], delta[1], device=device),
+        indexing='ij'
+    ), dim=-1) % 1
+
+    angles = 2 * math.pi * torch.rand(b, res[0]+1, res[1]+1, device=device)
+    gradients = torch.stack((torch.cos(angles), torch.sin(angles)), dim=-1)
+
+    def tile_grads(x_slice, y_slice):
+        return gradients[:, x_slice[0]:x_slice[1], y_slice[0]:y_slice[1]]\
+            .repeat_interleave(d[0], 1)\
+            .repeat_interleave(d[1], 2)
+
+    def dot(grad, shift):
+        g = grid[:shape[0], :shape[1]]
+        shifted = torch.stack((g[..., 0] + shift[0], g[..., 1] + shift[1]), dim=-1)
+        return (shifted * grad[:, :shape[0], :shape[1]]).sum(dim=-1)
+
+    n00 = dot(tile_grads([0, -1], [0, -1]), [0, 0])
+    n10 = dot(tile_grads([1, None], [0, -1]), [-1, 0])
+    n01 = dot(tile_grads([0, -1], [1, None]), [0, -1])
+    n11 = dot(tile_grads([1, None], [1, None]), [-1, -1])
+
+    t = fade(grid[:shape[0], :shape[1]])
+    lerp = lambda a, b, w: a + w * (b - a)
+    return math.sqrt(2) * lerp(lerp(n00, n10, t[..., 0]), lerp(n01, n11, t[..., 0]), t[..., 1])
+
+def new_batch_rand_perlin_2d_octaves(b, shape, res, octaves=1, persistence=0.5, device=None):
+    noise = torch.zeros((b,) + shape, device=device)
+    frequency = 1
+    amplitude = 1
+    for _ in range(octaves):
+        noise += amplitude * new_batch_rand_perlin_2d(
+            b, shape,
+            (frequency * res[0], frequency * res[1]),
+            device=device
+        )
+        frequency *= 2
+        amplitude *= persistence
+    return noise
+
+# === Generate Perlin-Based Direction Field with 3D Vectors ===
+
+def generate_dirs2(batchsize=1, w=64, h=64,
+                   visualize=True, batch_to_show=0,
+                   step=4, device='cuda'):
+    """
+    Generate 2D Perlin-based direction fields with shape [B, H, W, 3]
+
+    Returns:
+        dirs (torch.Tensor): [B, H, W, 3] unit vectors.
+    """
+    resolutions = [(2**i, 2**i) for i in range(1, 2)]
+    res = resolutions[np.random.randint(0, len(resolutions))]
+    octaves = np.random.randint(1, 3) #2
+    persistence = 0.7 * (np.random.rand() + 0.2)
+
+    # Generate 3 noise fields → (X, Y, Z components)
+    noise_x = new_batch_rand_perlin_2d_octaves(
+        b=batchsize, shape=(h, w), res=res,
+        octaves=octaves, persistence=persistence, device=device
+    )
+    noise_y = new_batch_rand_perlin_2d_octaves(
+        b=batchsize, shape=(h, w), res=res,
+        octaves=octaves, persistence=persistence, device=device
+    )
+    noise_z = new_batch_rand_perlin_2d_octaves(
+        b=batchsize, shape=(h, w), res=res,
+        octaves=octaves, persistence=persistence, device=device
+    )
+
+    # Stack to [B, H, W, 3]
+    dirs = torch.stack([noise_x, noise_y, noise_z], dim=-1)
+
+    # Normalize to unit vectors
+    norm = torch.norm(dirs, dim=-1, keepdim=True).clamp(min=1e-8)
+    dirs = dirs / norm
+
+    if visualize:
+        dirs_b = dirs[batch_to_show].detach().cpu().numpy()  # (H, W, 3)
+        X, Y = np.meshgrid(np.arange(0, w, step), np.arange(0, h, step))
+        U = dirs_b[::step, ::step, 0]
+        V = dirs_b[::step, ::step, 1]
+
+        plt.figure(figsize=(6, 6))
+        plt.quiver(X, Y, U, V, angles='xy', scale_units='xy')
+        plt.gca().invert_yaxis()
+        plt.title(f"Batch {batch_to_show} - XY Direction Field (Quiver)")
+        plt.tight_layout()
+        plt.show()
+
+        # RGB visualization (clipped to [0,1])
+        rgb_img = np.clip((dirs_b + 1.0) / 2.0, 0, 1)
+        plt.figure(figsize=(6, 6))
+        plt.imshow(rgb_img)
+        plt.title(f"Batch {batch_to_show} - Directions as RGB")
+        plt.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+    return dirs
+
+
 def generate_mask(batchsize=None, w=None,h=None, device=None):
     
     
@@ -2249,8 +2358,8 @@ def generate_dirs(batchsize=1, w=64, h=64, sigma_range=(2.0, 8.0), visualize=Tru
     """
     # Create random directions on GPU
     dirs = torch.randn(batchsize, w, h, 3, device=device)
-
-    # For smoothing, move to CPU (scipy doesn't support GPU tensors)
+    #selected = dirs[0,...]  # shape: (batchsize, w, h)
+    #dirs = selected.unsqueeze(0).repeat(dirs.shape[0], 1, 1, 1)  
     dirs_cpu = dirs.cpu().numpy()
 
     for b in range(batchsize):
@@ -2468,7 +2577,16 @@ def gen_synth2(batchsize=None, bvecs=None, bvals=None, device=None,
     if mask is None:
         mask = generate_mask2(batchsize=batchsize, w=w, h=h, device=device)
         mask = mask.permute(1, 2, 0)
-
+    
+    #slice_to_copy = mask[:, :, 0]  
+    #mask = slice_to_copy.unsqueeze(2).repeat(1, 1, batchsize).to(device)
+    
+    """ print(mask.shape)
+    for i in range(10):
+     plt.imshow(mask[:,:,i])
+     plt.show()
+    exit()
+     """
     eigvals_all = torch.load("invivo_eig_dist")
     lambdas = eigvals_all
     lambdas, _ = torch.sort(lambdas, dim=-1, descending=True)
@@ -2486,7 +2604,14 @@ def gen_synth2(batchsize=None, bvecs=None, bvals=None, device=None,
     S0_wmrange = torch.tensor([0.0, 1.], device=device)
     S0_gmrange = torch.tensor([0.0, 1.], device=device)
     S0_csfrange = torch.tensor([0.0, 1.], device=device)
-
+    
+    #S0_wmrange=torch.tensor([0.05, 0.25], device=device)
+    #S0_gmrange=torch.tensor([0.2, 0.5], device=device)
+    #S0_csfrange=torch.tensor([0.5, 1.0], device=device)
+    wm_min=wm_eigvals.min()
+    wm_max=np.percentile(wm_eigvals, 99.99)
+    wm_range=torch.tensor([wm_min, wm_max], device=device)
+    
     num_signals = 1  # average over these many signals
 
     while True:
@@ -2497,24 +2622,57 @@ def gen_synth2(batchsize=None, bvecs=None, bvals=None, device=None,
 
         for i in range(num_signals):
             # ===== WM =====
+            #wm_eigvals=lambdas
             _, wm_dists = prepare_eigenvalue_distributions(
-                          wm_eigvals, batch_size=batchsize, w=w, h=h, num_bins=50000)
-            lambdas_wm = sample_eigenvalues(wm_dists, batch_size=batchsize, w=w, h=h, keep_fraction=0.8)
-            #lambdas_wm = sample_eigenvalues2(wm_dists, batch_size=batchsize, w=w, h=h)
+                          wm_eigvals, batch_size=batchsize, w=w, h=h, num_bins=100000)
+            #lambdas_wm = sample_eigenvalues(wm_dists, batch_size=batchsize, w=w, h=h, keep_fraction=1.0)
+            lambdas_wm_high = wm_sample_eigenvalues(wm_dists, batch_size=batchsize, w=w, h=h, mode='high')
+            
+            lambdas_wm=torch.zeros(batchsize, w, h, 3, device=device)
+            #lambdas_wm = generate_lambda_wm(w=w, h=h, batchsize=batchsize, eig_range=(lambdas_wm_high.min(), lambdas_wm_high.max()), device='cuda')
+            wm_min=lambdas_wm_high.min()
+            wm_max=np.percentile(lambdas_wm_high, 99.99)
+            wm_range_high=torch.tensor([wm_min, wm_max], device=device)
+ 
+            lambdas_wm[..., 0]=next(gen_perlin(w, h, batchsize, lacunarity=2,  lims=wm_range, device=device))
+            #lambdas_wm[..., 1]=next(gen_perlin(w, h, batchsize, lacunarity=2,  lims=wm_range, device=device))
+            #lambdas_wm[..., 2]=next(gen_perlin(w, h, batchsize, lacunarity=2,  lims=wm_range, device=device))
+            
+            lambdas_wm[...,1]=lambdas_wm[..., 0]*(torch.rand(1).to(device)*(0.5-0.1)+ 0.1)
+            lambdas_wm[...,2]=lambdas_wm[..., 0]*(torch.rand(1).to(device)*(0.5-0.1)+ 0.1)
+            
+            #lambdas_wm_high = wm_sample_eigenvalues(wm_dists, batch_size=batchsize, w=w, h=h, mode='high')
+            #lambdas_wm_high = lambdas_wm_high.permute(1, 2, 0, 3).to(device)
+            #lambdas_wm_high, _ = torch.sort(lambdas_wm_high, dim=-1, descending=True)
+            
+            
+            #lambdas_wm_mixed = wm_sample_eigenvalues(wm_dists, batch_size=batchsize, w=w, h=h, mode='mixed')
+            #lambdas_wm_mixed = lambdas_wm_mixed.permute(1, 2, 0, 3).to(device)
+            #lambdas_wm_mixed, _ = torch.sort(lambdas_wm_mixed, dim=-1, descending=True)
+            
+            
+            #lambdas_wm=torch.zeros_like(lambdas_wm_mixed).to(device)
             lambdas_wm = lambdas_wm.permute(1, 2, 0, 3).to(device)
+            #shape = lambdas_wm[..., 1].shape
             lambdas_wm, _ = torch.sort(lambdas_wm, dim=-1, descending=True)
-            lambdas_wm[..., 0] = lambdas_wm[..., 0] + ( 0.1)*lambdas_wm[..., 1]
-            lambdas_wm[..., 1]=lambdas_wm[..., 1]*(torch.rand(1).to(device) * (0.7 - 0.5) + 0.5)
-            lambdas_wm[..., 2]=lambdas_wm[..., 2]*(torch.rand(1).to(device) * (0.7 - 0.5) + 0.5)
+            
+            #f = 2.0 + 4.5 * torch.rand(1).to(device)  # f in [2.0, 6.5]
+            #lambdas_wm[..., 0] = lambdas_wm[..., 1] * f
+            #lambdas_wm[..., 1]= lambdas_wm[..., 2]
+            #lambdas_wm[..., 2]= lambdas_wm[..., 2]*(torch.rand(1).to(device)*(0.9-0.4)+ 0.4)
+            
+            
             L_wm = torch.diag_embed(lambdas_wm).to(device)
             
             R_wm = build_rotation_from_dirs(
-                                generate_dirs(batchsize, w, h, sigma_range=(5, 10), visualize=False)).permute(1, 2, 0, 3, 4)
-            L_wm = R_wm.transpose(-1, -2) @ L_wm @ R_wm
+                   generate_dirs2(batchsize, w, h, device=device, visualize=False)).permute(1, 2, 0, 3, 4)
 
+            L_wm = R_wm.transpose(-1, -2) @ L_wm @ R_wm
+           
             # ===== GM =====
+            #gm_eigvals=lambdas
             _, gm_dists = prepare_eigenvalue_distributions(
-                            gm_eigvals, batch_size=batchsize, w=w, h=h, num_bins=50000)
+                            gm_eigvals, batch_size=batchsize, w=w, h=h, num_bins=100000)
             lambdas_gm = sample_eigenvalues(gm_dists, batch_size=batchsize, w=w, h=h, keep_fraction=0.9)
             lambdas_gm = lambdas_gm.permute(1, 2, 0, 3).to(device)
             lambdas_gm[..., 0] = lambdas_gm[..., 1] = lambdas_gm[..., 2]
@@ -2524,15 +2682,17 @@ def gen_synth2(batchsize=None, bvecs=None, bvals=None, device=None,
             lambdas_gm[..., 2] = lambdas_gm[..., 2]*(torch.rand(1).to(device) * (0.99 - 0.8) + 0.8)
             
             lambdas_gm, _ = torch.sort(lambdas_gm, dim=-1, descending=True)
-            
-            L_gm = torch.diag_embed(lambdas_gm).to(device)
             R_gm = build_rotation_from_dirs(
-                            generate_dirs(batchsize, w, h, sigma_range=(50, 52), visualize=False)).permute(1, 2, 0, 3, 4)
+                   generate_dirs2(batchsize, w, h, device=device, visualize=False)).permute(1, 2, 0, 3, 4)
+            L_gm = torch.diag_embed(lambdas_gm).to(device)
+                        
+
             L_gm = R_gm.transpose(-1, -2) @ L_gm @ R_gm
 
             # ===== CSF =====
+            #csf_eigvals=lambdas
             _, csf_dists = prepare_eigenvalue_distributions(
-                                 csf_eigvals, batch_size=batchsize, w=w, h=h, num_bins=50000)
+                                 csf_eigvals, batch_size=batchsize, w=w, h=h, num_bins=100000)
             lambdas_csf = sample_eigenvalues(csf_dists, batch_size=batchsize, w=w, h=h, keep_fraction=1.0)
             lambdas_csf = lambdas_csf.permute(1, 2, 0, 3).to(device)
             lambdas_csf[..., 0] = lambdas_csf[..., 1] = lambdas_csf[..., 2]
@@ -2545,7 +2705,8 @@ def gen_synth2(batchsize=None, bvecs=None, bvals=None, device=None,
             
             L_csf = torch.diag_embed(lambdas_csf).to(device)
             R_csf = build_rotation_from_dirs(
-                                    generate_dirs(batchsize, w, h, sigma_range=(50, 52), visualize=False)).permute(1, 2, 0, 3, 4)
+                   generate_dirs2(batchsize, w, h, device=device, visualize=False)).permute(1, 2, 0, 3, 4)
+            
             L_csf = R_csf.transpose(-1, -2) @ L_csf @ R_csf
 
             # ===== D_i for this iteration =====
@@ -2555,7 +2716,7 @@ def gen_synth2(batchsize=None, bvecs=None, bvals=None, device=None,
             D_i[mask == 3] = L_csf[mask == 3]
             D_i = torch.nan_to_num(D_i, nan=epsilon, posinf=epsilon, neginf=epsilon).float()
             #R=generate_random_rots_uniform(w=w, h=h, batch_size=batchsize, device=device)
-            #D_i = R.transpose(-1, -2) @ D_i @ R
+            D_i = R_wm.transpose(-1, -2) @ D_i @ R_wm
 
 
             # ===== S0 for this iteration =====
@@ -2786,8 +2947,260 @@ class DtiSynth(nn.Module):
         D = L @ L.transpose(-1, -2)  # [W, H, B, 3, 3]
         
         return D
+""" 
+class DtiSynth3(nn.Module):
 
-""" class DtiSynth(nn.Module):
+    def __init__(self, in_channels=91, bvals=None):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            
+            nn.Conv3d(in_channels, 128, kernel_size=1, padding=0),
+            nn.BatchNorm3d(128),
+            nn.ReLU(),
+            nn.Conv3d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(),
+            nn.Conv3d(128, 256, kernel_size=1, padding=0),
+            nn.BatchNorm3d(256),
+            nn.ReLU(),
+            nn.Conv3d(256, 256, kernel_size=1, padding=0),
+            nn.BatchNorm3d(256),
+            nn.ReLU(),
+            #nn.Conv3d(256, 256, kernel_size=3, padding=1),
+            #nn.ReLU(),
+            nn.Conv3d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.BatchNorm3d(256),
+            nn.Conv3d(256, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv3d(256, 128, kernel_size=1, padding=0),
+            nn.ReLU(),
+            nn.Conv3d(128, 64, kernel_size=1, padding=0),
+            nn.BatchNorm3d(64),
+            nn.ReLU(),
+            nn.Conv3d(64, 32, kernel_size=1),
+            nn.Conv3d(32, 6, kernel_size=1)
+        )
+        #self.register_buffer('bvals', torch.as_tensor(bvals, dtype=torch.float32))  # [N]
+        self.bvals=bvals
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, bvecs):
+        
+        
+        # Compute mean_b0 from the first channel (assumed b=0)
+        x=torch.abs(x)
+        S0 = x[0,0,...]  # [W, H, B]
+        #print(x.shape)
+        # Predict tensor using network (SPD)
+        params = self.encoder(x)  # [1, 6, W, H, B]
+        params = params.squeeze(0).permute(1, 2, 3, 0)  # [W, H, B, 6]
+         
+        
+        # First 3 are diagonal (positive)
+        l11 = torch.abs(params[..., 0]) 
+        l21 = params[..., 1] 
+        l31 = params[..., 2] 
+        l22 = torch.abs(params[..., 3]) 
+        l32 = params[..., 4]
+        l33 = torch.abs(params[..., 5])
+
+        L = torch.zeros(*params.shape[:-1], 3, 3, device=params.device)
+        
+
+        L[..., 0, 0] = l11
+        L[..., 1, 0] = l21
+        L[..., 2, 0] = l31
+        L[..., 1, 1] = l22
+        L[..., 2, 1] = l32
+        L[..., 2, 2] = l33
+        D = L @ L.transpose(-1, -2)  # [W, H, B, 3, 3]
+        
+        return D
+
+        """
+
+
+import torch
+import torch.nn as nn
+
+class ResBlock3D(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(channels),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm3d(channels),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(x + self.block(x))
+
+class DtiSynth3(nn.Module):
+    def __init__(self, in_channels=91, bvals=None):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv3d(in_channels, 128, kernel_size=1, padding=0),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(128, 128, kernel_size=1, padding=0),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(128, 256, kernel_size=3, padding=1),
+            #nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(256, 256, kernel_size=3, padding=1),
+            #nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(256, 128, kernel_size=3, padding=1),
+            #nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(128, 64, kernel_size=1, padding=0),
+            #nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(64, 32, kernel_size=1, padding=0),
+            #nn.BatchNorm3d(32),
+            #nn.ReLU(inplace=True),
+
+            nn.Conv3d(32, 6, kernel_size=1)  # Final output
+        )
+
+        self.bvals = bvals
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, bvecs):
+        x = torch.abs(x)
+        x = self.encoder(x)  # [1, 6, W, H, B]
+
+        params = x.squeeze(0).permute(1, 2, 3, 0)  # [W, H, B, 6]
+
+        # SPD matrix (Cholesky decomposition)
+        l11 = torch.abs(params[..., 0])
+        l21 = params[..., 1]
+        l31 = params[..., 2]
+        l22 = torch.abs(params[..., 3])
+        l32 = params[..., 4]
+        l33 = torch.abs(params[..., 5])
+
+        L = torch.zeros(*params.shape[:-1], 3, 3, device=params.device)
+        L[..., 0, 0] = l11
+        L[..., 1, 0] = l21
+        L[..., 2, 0] = l31
+        L[..., 1, 1] = l22
+        L[..., 2, 1] = l32
+        L[..., 2, 2] = l33
+
+        D = L @ L.transpose(-1, -2)  # [W, H, B, 3, 3]
+        return D
+
+
+
+
+class DtiSynth3_1(nn.Module):
+    def __init__(self, in_channels=91, bvals=None):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv3d(in_channels, 128, kernel_size=1, padding=0),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(128, 128, kernel_size=1, padding=0),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(128, 256, kernel_size=1, padding=0),
+            nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv3d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+            
+            nn.Conv3d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm3d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(128, 64, kernel_size=1, padding=0),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv3d(64, 32, kernel_size=1, padding=0),
+            #nn.BatchNorm3d(32),
+            #nn.ReLU(inplace=True),
+
+            nn.Conv3d(32, 6, kernel_size=1)  # Final output
+        )
+
+        self.bvals = bvals
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, bvecs):
+        x = torch.abs(x)
+        x = self.encoder(x)  # [1, 6, W, H, B]
+
+        params = x.squeeze(0).permute(1, 2, 3, 0)  # [W, H, B, 6]
+
+        # SPD matrix (Cholesky decomposition)
+        l11 = torch.abs(params[..., 0])
+        l21 = params[..., 1]
+        l31 = params[..., 2]
+        l22 = torch.abs(params[..., 3])
+        l32 = params[..., 4]
+        l33 = torch.abs(params[..., 5])
+
+        L = torch.zeros(*params.shape[:-1], 3, 3, device=params.device)
+        L[..., 0, 0] = l11
+        L[..., 1, 0] = l21
+        L[..., 2, 0] = l31
+        L[..., 1, 1] = l22
+        L[..., 2, 1] = l32
+        L[..., 2, 2] = l33
+
+        D = L @ L.transpose(-1, -2)  # [W, H, B, 3, 3]
+        return D
+
+""" 
+class DtiSynth(nn.Module):
 
     def __init__(self, in_channels=91, bvals=None):
         super().__init__()
@@ -3030,6 +3443,53 @@ def prepare_eigenvalue_distributions(eigvals_all, batch_size, w, h, num_bins=200
 
 import torch
 
+def wm_sample_eigenvalues(eigen_dists, batch_size, w, h, mode='mixed'):
+    """
+    Sample eigenvalue triplets based on a mode:
+      mode='low'  -> sample only from lower half of distribution
+      mode='high' -> sample only from upper half of distribution
+      mode='mixed'-> sample from full distribution
+
+    Args:
+        eigen_dists (tuple): tuple of 3 (values, probs) for λ1, λ2, λ3
+        batch_size (int): number of batches
+        w, h (int): spatial size
+        mode (str): 'low', 'high', or 'mixed'
+
+    Returns:
+        Tensor of shape [batch_size, w, h, 3]
+    """
+    total_samples = batch_size * w * h
+    sampled = []
+
+    for values, probs in eigen_dists:
+        num_bins = values.shape[0]
+
+        # select region based on mode
+        if mode == 'low':
+            # first half of bins
+            region_values = values[: num_bins // 2]
+            region_probs = probs[: num_bins // 2]
+        elif mode == 'high':
+            # second half of bins
+            region_values = values[num_bins // 2 :]
+            region_probs = probs[num_bins // 2 :]
+        else:  # mixed
+            region_values = values
+            region_probs = probs
+
+        # normalize probabilities
+        region_probs = region_probs / region_probs.sum()
+
+        # sample indices
+        indices = torch.multinomial(region_probs, total_samples, replacement=True)
+        samples = region_values[indices]
+        sampled.append(samples)
+
+    samples_stack = torch.stack(sampled, dim=1)
+    return samples_stack.view(batch_size, w, h, 3)
+
+
 def sample_eigenvalues(eigen_dists, batch_size, w, h, keep_fraction=0.5):
     """
     Sample eigenvalue triplets but only from the middle part of the distributions.
@@ -3108,3 +3568,290 @@ def sample_eigenvalues2(wm_dist, batch_size, w, h, r_range=(0.3, 0.4)):
     eigs = torch.stack([l1, l2, l3], dim=-1)
     return eigs.view(batch_size, w, h, 3)
 
+import torch
+import torch.nn as nn
+
+class DtiSynth2D_1(nn.Module):
+    def __init__(self, in_channels=91, bvals=None):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 128, kernel_size=1, padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 128, kernel_size=1, padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=1, padding=0),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=1, padding=0),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=1, padding=0),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=1, padding=0),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 128, kernel_size=1, padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 64, kernel_size=1, padding=0),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 32, kernel_size=1, padding=0),
+            nn.ReLU(inplace=True),  # Removed BatchNorm for output stability
+
+            nn.Conv2d(32, 6, kernel_size=1)  # Final output: 6 Cholesky params
+        )
+
+        self.bvals = bvals
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, bvecs=None):
+        x = torch.abs(x)  # Ensure non-negative input
+        x = self.encoder(x)  # [B, 6, H, W]
+
+        params = x.permute(0, 2, 3, 1)  # [B, H, W, 6]
+
+        # Cholesky decomposition for SPD 3x3 matrices
+        l11 = torch.abs(params[..., 0])
+        l21 = params[..., 1]
+        l31 = params[..., 2]
+        l22 = torch.abs(params[..., 3])
+        l32 = params[..., 4]
+        l33 = torch.abs(params[..., 5])
+
+        L = torch.zeros(*params.shape[:-1], 3, 3, device=params.device)
+        L[..., 0, 0] = l11
+        L[..., 1, 0] = l21
+        L[..., 2, 0] = l31
+        L[..., 1, 1] = l22
+        L[..., 2, 1] = l32
+        L[..., 2, 2] = l33
+
+        D = L @ L.transpose(-1, -2)  # [B, H, W, 3, 3] SPD matrix
+        return D
+
+import torch
+import torch.nn as nn
+
+class DtiSynth2D_3(nn.Module):
+    def __init__(self, in_channels=91, bvals=None):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(32, 6, kernel_size=1, padding=0)  
+        )
+
+        self.bvals = bvals
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, bvecs=None):
+        x = torch.abs(x)  # Ensure non-negative input
+        x = self.encoder(x)  # [B, 6, H, W]
+
+        params = x.permute(0, 2, 3, 1)  # [B, H, W, 6]
+
+        # Cholesky decomposition for SPD 3x3 matrices
+        l11 = torch.abs(params[..., 0])
+        l21 = params[..., 1]
+        l31 = params[..., 2]
+        l22 = torch.abs(params[..., 3])
+        l32 = params[..., 4]
+        l33 = torch.abs(params[..., 5])
+
+        L = torch.zeros(*params.shape[:-1], 3, 3, device=params.device)
+        L[..., 0, 0] = l11
+        L[..., 1, 0] = l21
+        L[..., 2, 0] = l31
+        L[..., 1, 1] = l22
+        L[..., 2, 1] = l32
+        L[..., 2, 2] = l33
+
+        D = L @ L.transpose(-1, -2)  # [B, H, W, 3, 3] SPD matrix
+        return D
+
+class DtiSynth2D_3_1(nn.Module):
+    def __init__(self, in_channels=91, bvals=None):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 128, kernel_size=1, padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 128, kernel_size=1, padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(256, 128, kernel_size=1, padding=0),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(128, 64, kernel_size=1, padding=0),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(64, 32, kernel_size=1, padding=0),
+            nn.ReLU(inplace=True),
+
+            nn.Conv2d(32, 6, kernel_size=1, padding=0)  
+        )
+
+        self.bvals = bvals
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x, bvecs=None):
+        x = torch.abs(x)  # Ensure non-negative input
+        x = self.encoder(x)  # [B, 6, H, W]
+
+        params = x.permute(0, 2, 3, 1)  # [B, H, W, 6]
+
+        # Cholesky decomposition for SPD 3x3 matrices
+        l11 = torch.abs(params[..., 0])
+        l21 = params[..., 1]
+        l31 = params[..., 2]
+        l22 = torch.abs(params[..., 3])
+        l32 = params[..., 4]
+        l33 = torch.abs(params[..., 5])
+
+        L = torch.zeros(*params.shape[:-1], 3, 3, device=params.device)
+        L[..., 0, 0] = l11
+        L[..., 1, 0] = l21
+        L[..., 2, 0] = l31
+        L[..., 1, 1] = l22
+        L[..., 2, 1] = l32
+        L[..., 2, 2] = l33
+
+        D = L @ L.transpose(-1, -2)  # [B, H, W, 3, 3] SPD matrix
+        return D
+
+def generate_lambda_wm(w, h, batchsize, eig_range=(0.2, 1.2), device='cuda', num_eigs=3, correlation=0.7):
+    """
+    Generate correlated eigenvalue fields using Perlin noise.
+    Returns:
+        Tensor of shape [W, H, B, num_eigs] with values in [a, b].
+    Args:
+        correlation: float in [0, 1], 1 = fully correlated, 0 = independent
+    """
+    import torch
+    import numpy as np
+    correlation = np.random.uniform(0.5, 0.9) 
+    a, b = eig_range
+    resolutions = [(2**i, 2**i) for i in range(1, 2)]
+    res = resolutions[np.random.randint(0, len(resolutions))]
+    octaves = np.random.randint(1, 3)
+    persistence = 0.7 * (np.random.rand() + 0.2)
+
+    # Common base Perlin noise
+    noise_base = new_batch_rand_perlin_2d_octaves(
+        b=batchsize,
+        shape=(w, h),
+        res=res,
+        octaves=octaves,
+        persistence=persistence,
+        device=device
+    )  # shape [B, W, H]
+
+    noise_min = noise_base.amin(dim=(1, 2), keepdim=True)
+    noise_max = noise_base.amax(dim=(1, 2), keepdim=True)
+    noise_base = (noise_base - noise_min) / (noise_max - noise_min + 1e-8)
+
+    lambda_wm_eigs = []
+    for i in range(num_eigs):
+        # Optionally, add some local noise for less than full correlation
+        if correlation < 1.0:
+            noise_delta = torch.randn_like(noise_base) * (1 - correlation)
+            noise = correlation * noise_base + (1 - correlation) * noise_delta
+            noise = noise.clamp(0, 1)
+        else:
+            noise = noise_base
+
+        lambda_wm = a + (b - a) * noise
+        lambda_wm = lambda_wm.permute(1, 2, 0)  # [W, H, B]
+        lambda_wm_eigs.append(lambda_wm.unsqueeze(-1))
+
+    lambda_wm_all = torch.cat(lambda_wm_eigs, dim=-1)  # [W, H, B, 3]
+    return lambda_wm_all
